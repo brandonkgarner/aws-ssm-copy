@@ -1,5 +1,6 @@
 import argparse
 import re
+import subprocess
 import sys
 
 import boto3
@@ -67,19 +68,39 @@ class ParameterCopier(object):
         self.dry_run = False
 
     @staticmethod
-    def connect_to(profile, region):
+    def connect_to(profile, region, vault=False):
         kwargs = {}
         if profile is not None:
             kwargs["profile_name"] = profile
         if region is not None:
             kwargs["region_name"] = region
-        return boto3.Session(**kwargs)
+        if not vault:
+            return boto3.Session(**kwargs)
+        else:
+            envvars = subprocess.check_output(['aws-vault', 'exec', profile, '--', 'env'])
+            for envline in envvars.split(b'\n'):
+                line = envline.decode('utf8')
+                eqpos = line.find('=')
+                if eqpos < 4:
+                    continue
+                k = line[0:eqpos]
+                v = line[eqpos + 1:]
+                if k == 'AWS_ACCESS_KEY_ID':
+                    aws_access_key_id = v
+                if k == 'AWS_SECRET_ACCESS_KEY':
+                    aws_secret_access_key = v
+                if k == 'AWS_SESSION_TOKEN':
+                    aws_session_token = v
 
-    def connect_to_source(self, profile, region):
-        self.source_ssm = self.connect_to(profile, region).client("ssm")
+            return boto3.Session(
+                aws_access_key_id, aws_secret_access_key, aws_session_token
+            )
 
-    def connect_to_target(self, profile, region):
-        self.target_ssm = self.connect_to(profile, region).client("ssm")
+    def connect_to_source(self, profile, region, vault):
+        self.source_ssm = self.connect_to(profile, region, vault).client("ssm")
+
+    def connect_to_target(self, profile, region, vault):
+        self.target_ssm = self.connect_to(profile, region, vault).client("ssm")
 
     def load_source_parameters(self, arg, recursive, one_level):
         result = {}
@@ -302,6 +323,26 @@ class ParameterCopier(object):
             action="store_true",
             help="copy the tags of the parameters too",
         )
+        vault_group = parser.add_mutually_exclusive_group()
+        vault_group.add_argument(
+            "--aws-vault",
+            "-V",
+            dest="vault",
+            action="store_true",
+            help="use aws-vault for MFA-enabled profile connections",
+        )
+        vault_group.add_argument(
+            "--aws-vault-source-only",
+            dest="vault_source",
+            action="store_true",
+            help="use aws-vault for MFA-enabled source profile connection",
+        )
+        vault_group.add_argument(
+            "--aws-vault-target-only",
+            dest="vault_target",
+            action="store_true",
+            help="use aws-vault for MFA-enabled target profile connection",
+        )
 
         parser.add_argument(
             "parameters", metavar="PARAMETER", type=str, nargs="+", help="source path"
@@ -309,8 +350,8 @@ class ParameterCopier(object):
         options = parser.parse_args()
 
         try:
-            self.connect_to_source(options.source_profile, options.source_region)
-            self.connect_to_target(options.target_profile, options.target_region)
+            self.connect_to_source(options.source_profile, options.source_region, options.vault or options.vault_source)
+            self.connect_to_target(options.target_profile, options.target_region, options.vault or options.vault_target)
             self.target_path = options.target_path
             self.dry_run = options.dry_run
             self.copy(
